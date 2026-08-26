@@ -38,7 +38,6 @@
     align-items: stretch;
   }
 
-  /* ---------- Sidebar : notebook spine + unit tabs ---------- */
   .spine{
     width: 26px;
     background: repeating-linear-gradient(
@@ -65,6 +64,7 @@
     flex-direction:column;
     gap: 10px;
     border-right: 1px solid var(--paper-line);
+    overflow-y:auto;
   }
 
   .sidebar h1{
@@ -197,6 +197,7 @@
   .pen-colors{
     display:flex;
     gap: 8px;
+    flex-wrap:wrap;
   }
   .pen-color{
     width:20px; height:20px; border-radius:50%;
@@ -282,7 +283,6 @@
     min-height: 14px;
   }
 
-  /* ---------- Main : A4 cornell paper ---------- */
   .main{
     flex:1;
     display:flex;
@@ -292,7 +292,6 @@
     overflow:auto;
   }
 
-  /* page-turn tab strip */
   .page-nav{
     width: var(--page-w);
     display:flex;
@@ -467,7 +466,6 @@
     font-style: italic;
   }
 
-  /* pasted / inserted images inside note boxes */
   .editable img{
     display:block;
     max-width: 100%;
@@ -480,7 +478,6 @@
   .editable img.img-m{ max-width: 65%; }
   .editable img.img-l{ max-width: 100%; }
   body:not(.locked) .editable img{ cursor: zoom-in; }
-  .editable img.img-selected{ outline: 2px solid var(--margin-red); outline-offset: 2px; }
 
   .summary-row{
     flex-shrink:0;
@@ -516,14 +513,12 @@
   }
 
   @media (max-width: 900px){
-    .sidebar{ width: 200px; }
+    .sidebar{ width: 220px; }
   }
   @media (max-width: 620px){
     .app{ flex-direction:column; }
     .spine{ width:100%; height:16px; }
-    .sidebar{ width:100%; flex-direction:row; flex-wrap:wrap; border-right:none; border-bottom:1px solid var(--paper-line); }
-    .sidebar h1, .sidebar .sub{ width:100%; }
-    .sidebar-foot{ margin-top:0; flex-direction:row; }
+    .sidebar{ width:100%; flex-direction:column; border-right:none; border-bottom:1px solid var(--paper-line); max-height:60vh; }
     .main{ padding: 16px 8px; }
   }
 </style>
@@ -631,23 +626,56 @@
 
 <script>
 const COLORS = ['#3E7C6B','#C98A2C','#7C4A6B','#2C5F8A','#A34C36'];
-const STORAGE_KEY = 'cornell-units-v3';
-const PASS_KEY = 'cornell-editor-pass';
-const SETTINGS_KEY = 'cornell-settings';
 const MIN_FONT = 9;
+
+// ---- GitHub-backed storage (works on real hosting, unlike window.storage) ----
+const GH_OWNER = 'jis2on';
+const GH_REPO = 'note';
+const DATA_PATH = 'note-data.json';
+const TOKEN_LS_KEY = 'cornell-gh-token';
+
+let ghBranch = null;
+let ghToken = null;
+let units = [];
+let activeId = null;
+let editMode = false;
+let saveTimer = null;
+let activePageMap = {};
+let drawings = {};
+let passHash = null;
 let settings = { fontFamily: "'Noto Sans KR', sans-serif", fontSize: 15, textColor: '#26344A' };
+
+function uid(pre){ return (pre||'u') + '_' + Math.random().toString(36).slice(2,10); }
+function emptyPage(){ return { id: uid('p'), cue:'', notes:'', summary:'' }; }
+function defaultUnits(){
+  return [{
+    id: uid('u'),
+    title: '1단원. 새 단원',
+    color: COLORS[0],
+    date: '',
+    pages: [ emptyPage() ]
+  }];
+}
+function migrate(list){
+  return (list || []).map(u => {
+    if(!u.pages){
+      u.pages = [{ id: uid('p'), cue: u.cue||'', notes: u.notes||'', summary: u.summary||'' }];
+      delete u.cue; delete u.notes; delete u.summary;
+    }
+    if(!u.pages.length) u.pages = [emptyPage()];
+    return u;
+  });
+}
 
 function maxFontFor(field){
   return field === 'cue' ? settings.fontSize + 1 : settings.fontSize;
 }
-
 function applyFontFamilyCSS(){
   document.documentElement.style.setProperty('--note-font', settings.fontFamily);
 }
 function applyTextColorCSS(){
   document.documentElement.style.setProperty('--note-color', settings.textColor);
 }
-
 function syncFontSettingsUI(){
   const famSel = document.getElementById('fontFamilySelect');
   const sizeSel = document.getElementById('fontSizeSelect');
@@ -658,46 +686,164 @@ function syncFontSettingsUI(){
   });
 }
 
-async function loadSettings(){
+async function sha256Hex(str){
+  const enc = new TextEncoder().encode(str);
+  const buf = await crypto.subtle.digest('SHA-256', enc);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+function utf8ToBase64(str){
+  return btoa(unescape(encodeURIComponent(str)));
+}
+
+async function resolveBranch(){
+  if(ghBranch) return ghBranch;
   try{
-    const res = await window.storage.get(SETTINGS_KEY, true);
-    if(res && res.value){
-      const parsed = JSON.parse(res.value);
-      settings = {
-        fontFamily: parsed.fontFamily || settings.fontFamily,
-        fontSize: parsed.fontSize || settings.fontSize,
-        textColor: parsed.textColor || settings.textColor
-      };
+    const res = await fetch(`https://api.github.com/repos/${GH_OWNER}/${GH_REPO}`);
+    if(res.ok){
+      const j = await res.json();
+      ghBranch = j.default_branch || 'main';
+      return ghBranch;
     }
-  }catch(e){ /* keep defaults */ }
+  }catch(e){ /* fall through */ }
+  ghBranch = 'main';
+  return ghBranch;
+}
+
+async function loadRemoteData(){
+  const branch = await resolveBranch();
+  try{
+    const res = await fetch(`https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${branch}/${DATA_PATH}?_=${Date.now()}`, { cache: 'no-store' });
+    if(res.ok) return await res.json();
+  }catch(e){ /* no data yet, or offline */ }
+  return null;
+}
+
+async function ensureToken(){
+  if(ghToken) return ghToken;
+  try{
+    const stored = localStorage.getItem(TOKEN_LS_KEY);
+    if(stored){ ghToken = stored; return ghToken; }
+  }catch(e){ /* ignore */ }
+  return null;
+}
+async function promptForToken(){
+  const t = prompt('저장하려면 이 저장소(jis2on/note)에 쓰기 권한이 있는 GitHub 개인 액세스 토큰(PAT)이 필요해요.\n\n한 번만 입력하면 이 브라우저에 저장되고, 학생에게는 보이지 않습니다.\n토큰을 입력해주세요:');
+  if(!t) return null;
+  ghToken = t.trim();
+  try{ localStorage.setItem(TOKEN_LS_KEY, ghToken); }catch(e){ /* ignore */ }
+  return ghToken;
+}
+
+async function getFileSha(token, branch){
+  const res = await fetch(`https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${DATA_PATH}?ref=${branch}`, {
+    headers: { Authorization: `token ${token}`, Accept: 'application/vnd.github+json' }
+  });
+  if(res.status === 404) return null;
+  if(res.status === 401 || res.status === 403){
+    try{ localStorage.removeItem(TOKEN_LS_KEY); }catch(e){}
+    ghToken = null;
+    throw new Error('토큰이 유효하지 않거나 저장소 쓰기 권한이 없습니다.');
+  }
+  if(!res.ok) throw new Error('GitHub 연결 실패 (코드 ' + res.status + ')');
+  const j = await res.json();
+  return j.sha;
+}
+
+async function commitData(){
+  let token = await ensureToken();
+  if(!token){
+    token = await promptForToken();
+    if(!token) throw new Error('토큰이 없어 저장할 수 없습니다.');
+  }
+  const branch = await resolveBranch();
+  const sha = await getFileSha(token, branch);
+  const payload = { units, settings, drawings, passHash };
+  const body = {
+    message: '노트 업데이트 ' + new Date().toISOString(),
+    content: utf8ToBase64(JSON.stringify(payload)),
+    branch
+  };
+  if(sha) body.sha = sha;
+  const res = await fetch(`https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${DATA_PATH}`, {
+    method: 'PUT',
+    headers: { Authorization: `token ${token}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if(!res.ok){
+    if(res.status === 401 || res.status === 403){
+      try{ localStorage.removeItem(TOKEN_LS_KEY); }catch(e){}
+      ghToken = null;
+      throw new Error('토큰이 유효하지 않거나 쓰기 권한이 없습니다. 다시 저장을 시도하면 토큰을 새로 입력할 수 있어요.');
+    }
+    const errJson = await res.json().catch(() => ({}));
+    throw new Error(errJson.message || ('저장 실패 (코드 ' + res.status + ')'));
+  }
+  return true;
+}
+
+function scheduleSave(){
+  clearTimeout(saveTimer);
+  const note = document.getElementById('saveNote');
+  note.textContent = '저장 대기 중…';
+  saveTimer = setTimeout(async () => {
+    note.textContent = 'GitHub에 저장 중…';
+    try{
+      await commitData();
+      note.textContent = '저장됨 · ' + new Date().toLocaleTimeString('ko-KR', {hour:'2-digit', minute:'2-digit'});
+      setTimeout(() => { if(note.textContent.startsWith('저장됨')) note.textContent = ''; }, 3000);
+    }catch(e){
+      note.textContent = '저장 실패 · ' + e.message;
+    }
+  }, 3000);
+}
+
+async function loadAll(){
+  const remote = await loadRemoteData();
+  if(remote){
+    units = migrate(remote.units);
+    if(!Array.isArray(units) || units.length === 0) units = defaultUnits();
+    settings = Object.assign({ fontFamily: "'Noto Sans KR', sans-serif", fontSize: 15, textColor: '#26344A' }, remote.settings || {});
+    drawings = remote.drawings || {};
+    passHash = remote.passHash || null;
+  } else {
+    units = defaultUnits();
+    drawings = {};
+    passHash = null;
+  }
   applyFontFamilyCSS();
   applyTextColorCSS();
   syncFontSettingsUI();
+  activeId = units[0].id;
+  renderTabs();
+  renderPage();
+  window.addEventListener('resize', refitAll);
+  window.addEventListener('load', refitAll);
+  if(document.fonts && document.fonts.ready){
+    document.fonts.ready.then(() => { refitAll(); setTimeout(refitAll, 150); });
+  } else {
+    setTimeout(refitAll, 400);
+  }
 }
 
-async function saveSettings(){
-  await window.storage.set(SETTINGS_KEY, JSON.stringify(settings), true);
-}
-
-document.getElementById('fontFamilySelect').addEventListener('change', async (e) => {
+document.getElementById('fontFamilySelect').addEventListener('change', (e) => {
   settings.fontFamily = e.target.value;
   applyFontFamilyCSS();
-  await saveSettings();
   renderPage();
+  scheduleSave();
 });
-document.getElementById('fontSizeSelect').addEventListener('change', async (e) => {
+document.getElementById('fontSizeSelect').addEventListener('change', (e) => {
   settings.fontSize = parseInt(e.target.value, 10);
-  await saveSettings();
   renderPage();
+  scheduleSave();
 });
 document.querySelectorAll('#textColorSwatches .pen-color').forEach(sw => {
-  sw.addEventListener('click', async () => {
+  sw.addEventListener('click', () => {
     settings.textColor = sw.dataset.color;
     applyTextColorCSS();
     document.querySelectorAll('#textColorSwatches .pen-color').forEach(s => s.classList.remove('sel'));
     sw.classList.add('sel');
-    await saveSettings();
     renderPage();
+    scheduleSave();
   });
 });
 
@@ -710,14 +856,12 @@ function applyToSelection(fn){
     alert('먼저 색을 바꿀 글자를 드래그해서 선택해주세요.');
     return;
   }
-  // make sure the selection is inside a note box
   if(!lastFocusedEditable.contains(sel.anchorNode)) return;
   document.execCommand('styleWithCSS', false, true);
   fn();
   lastFocusedEditable.dispatchEvent(new Event('input'));
 }
 
-// mousedown+preventDefault keeps the text selection alive when the swatch is clicked
 document.querySelectorAll('#selColorSwatches .sel-color-swatch').forEach(sw => {
   sw.addEventListener('mousedown', (e) => e.preventDefault());
   sw.addEventListener('click', () => {
@@ -760,7 +904,6 @@ function downscaleImage(file){
         const c = document.createElement('canvas');
         c.width = width; c.height = height;
         const cx = c.getContext('2d');
-        // white backing so transparent PNGs don't turn black as JPEG
         cx.fillStyle = '#FFFFFF';
         cx.fillRect(0, 0, width, height);
         cx.drawImage(img, 0, 0, width, height);
@@ -782,7 +925,6 @@ async function insertImageFile(file){
     lastFocusedEditable.focus();
     const ok = document.execCommand('insertHTML', false, `<img src="${dataUrl}" class="img-m">`);
     if(!ok){
-      // fallback for browsers that refuse execCommand
       const img = document.createElement('img');
       img.src = dataUrl;
       img.className = 'img-m';
@@ -807,87 +949,11 @@ document.getElementById('imageFileInput').addEventListener('change', async (e) =
   e.target.value = '';
 });
 
-let units = [];
-let activeId = null;
-let editMode = false;
-let saveTimer = null;
-let activePageMap = {}; // unitId -> page index
-
-function uid(pre){ return (pre||'u') + '_' + Math.random().toString(36).slice(2,10); }
-
-function emptyPage(){ return { id: uid('p'), cue:'', notes:'', summary:'' }; }
-
-function defaultUnits(){
-  return [{
-    id: uid('u'),
-    title: '1단원. 새 단원',
-    color: COLORS[0],
-    date: '',
-    pages: [ emptyPage() ]
-  }];
-}
-
-function migrate(list){
-  return list.map(u => {
-    if(!u.pages){
-      u.pages = [{ id: uid('p'), cue: u.cue||'', notes: u.notes||'', summary: u.summary||'' }];
-      delete u.cue; delete u.notes; delete u.summary;
-    }
-    if(!u.pages.length) u.pages = [emptyPage()];
-    return u;
-  });
-}
-
-async function loadUnits(){
-  try{
-    const res = await window.storage.get(STORAGE_KEY, true);
-    if(res && res.value){
-      units = migrate(JSON.parse(res.value));
-      if(!Array.isArray(units) || units.length === 0) units = defaultUnits();
-    } else {
-      units = defaultUnits();
-    }
-  }catch(e){
-    units = defaultUnits();
-  }
-  activeId = units[0].id;
-  renderTabs();
-  renderPage();
-  window.addEventListener('resize', refitAll);
-  window.addEventListener('load', refitAll);
-  if(document.fonts && document.fonts.ready){
-    document.fonts.ready.then(() => { refitAll(); setTimeout(refitAll, 150); });
-  } else {
-    setTimeout(refitAll, 400);
-  }
-}
-
-async function persist(showNote){
-  try{
-    await window.storage.set(STORAGE_KEY, JSON.stringify(units), true);
-    if(showNote){
-      const n = document.getElementById('saveNote');
-      n.textContent = '저장됨 · ' + new Date().toLocaleTimeString('ko-KR', {hour:'2-digit', minute:'2-digit'});
-      setTimeout(()=>{ if(n.textContent.startsWith('저장됨')) n.textContent=''; }, 2500);
-    }
-  }catch(e){
-    document.getElementById('saveNote').textContent = '저장 실패 · 그림이 너무 많거나 클 수 있어요';
-  }
-}
-
-function scheduleSave(){
-  clearTimeout(saveTimer);
-  document.getElementById('saveNote').textContent = '저장 중…';
-  saveTimer = setTimeout(()=>persist(true), 700);
-}
-
 function getActive(){ return units.find(u => u.id === activeId); }
-
 function getActivePageIndex(u){
   const idx = activePageMap[u.id] || 0;
   return Math.min(idx, u.pages.length - 1);
 }
-
 function escapeHtml(s){
   const d = document.createElement('div');
   d.textContent = s;
@@ -947,6 +1013,7 @@ function renderPageNav(u){
       del.addEventListener('click', (e) => {
         e.stopPropagation();
         if(confirm(`${i+1}페이지를 삭제할까요?`)){
+          delete drawings[p.id];
           u.pages.splice(i, 1);
           activePageMap[u.id] = Math.max(0, Math.min(curIdx, u.pages.length - 1));
           renderTabs();
@@ -1032,11 +1099,9 @@ function renderPage(){
       scheduleSave();
     });
 
-    // remember which box the caret is in (for the "insert image" button)
     el.addEventListener('focus', () => { lastFocusedEditable = el; });
     el.addEventListener('mouseup', () => { lastFocusedEditable = el; });
 
-    // paste an image straight from the clipboard
     el.addEventListener('paste', async (e) => {
       if(!editMode) return;
       const items = (e.clipboardData && e.clipboardData.items) || [];
@@ -1044,13 +1109,12 @@ function renderPage(){
       for(const it of items){
         if(it.type && it.type.indexOf('image') === 0){ imageFile = it.getAsFile(); break; }
       }
-      if(!imageFile) return; // plain text paste: let the browser handle it
+      if(!imageFile) return;
       e.preventDefault();
       lastFocusedEditable = el;
       await insertImageFile(imageFile);
     });
 
-    // drag & drop an image file
     el.addEventListener('dragover', (e) => { if(editMode) e.preventDefault(); });
     el.addEventListener('drop', async (e) => {
       if(!editMode) return;
@@ -1061,7 +1125,6 @@ function renderPage(){
       await insertImageFile(file);
     });
 
-    // click an image to cycle its size
     el.addEventListener('click', (e) => {
       if(!editMode) return;
       if(e.target.tagName !== 'IMG') return;
@@ -1096,7 +1159,6 @@ function renderTabsDebounced(){
   tabsDebounceTimer = setTimeout(renderTabs, 400);
 }
 
-// ---- shrink-to-fit text ----
 function fitText(el){
   if(!el.dataset.maxFont) return;
   const max = parseFloat(el.dataset.maxFont);
@@ -1121,28 +1183,6 @@ let penWidth = 4;
 let eraserMode = false;
 let currentCanvas = null;
 let currentPageId = null;
-let drawSaveTimer = null;
-
-async function loadDrawing(pageId, ctx){
-  try{
-    const res = await window.storage.get('draw:' + pageId, true);
-    if(res && res.value){
-      const img = new Image();
-      img.onload = () => { ctx.drawImage(img, 0, 0, PAGE_W, PAGE_H); };
-      img.src = res.value;
-    }
-  }catch(e){ /* no drawing saved yet */ }
-}
-
-function scheduleDrawSave(pageId, canvas){
-  clearTimeout(drawSaveTimer);
-  drawSaveTimer = setTimeout(async () => {
-    try{
-      const dataUrl = canvas.toDataURL('image/png');
-      await window.storage.set('draw:' + pageId, dataUrl, true);
-    }catch(e){ /* best effort */ }
-  }, 500);
-}
 
 function initCanvas(pageId){
   const canvas = document.getElementById('drawCanvas');
@@ -1154,12 +1194,16 @@ function initCanvas(pageId){
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  loadDrawing(pageId, ctx);
+  const existing = drawings[pageId];
+  if(existing){
+    const img = new Image();
+    img.onload = () => { ctx.drawImage(img, 0, 0, PAGE_W, PAGE_H); };
+    img.src = existing;
+  }
   currentCanvas = canvas;
   currentPageId = pageId;
 
   let drawing = false;
-
   function pos(e){
     const rect = canvas.getBoundingClientRect();
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
@@ -1182,7 +1226,8 @@ function initCanvas(pageId){
   function end(){
     if(!drawing) return;
     drawing = false;
-    scheduleDrawSave(pageId, canvas);
+    drawings[pageId] = canvas.toDataURL('image/png');
+    scheduleSave();
   }
   canvas.addEventListener('pointerdown', start);
   canvas.addEventListener('pointermove', move);
@@ -1218,12 +1263,13 @@ document.getElementById('eraserBtn').addEventListener('click', () => {
   document.getElementById('eraserBtn').classList.toggle('on', eraserMode);
 });
 
-document.getElementById('clearCanvasBtn').addEventListener('click', async () => {
+document.getElementById('clearCanvasBtn').addEventListener('click', () => {
   if(!currentCanvas) return;
   if(!confirm('이 페이지의 그림을 모두 지울까요?')) return;
   const ctx = currentCanvas.getContext('2d');
   ctx.clearRect(0, 0, currentCanvas.width, currentCanvas.height);
-  try{ await window.storage.delete('draw:' + currentPageId, true); }catch(e){ /* ignore */ }
+  delete drawings[currentPageId];
+  scheduleSave();
 });
 
 document.getElementById('addUnitBtn').addEventListener('click', () => {
@@ -1244,41 +1290,39 @@ document.getElementById('addUnitBtn').addEventListener('click', () => {
   scheduleSave();
 });
 
-// ---- password gate for edit mode ----
-async function sha256Hex(str){
-  const enc = new TextEncoder().encode(str);
-  const buf = await crypto.subtle.digest('SHA-256', enc);
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
-}
-async function getStoredHash(){
-  try{
-    const res = await window.storage.get(PASS_KEY, true);
-    return (res && res.value) ? res.value : null;
-  }catch(e){ return null; }
-}
-async function savePassword(pw){
-  const hash = await sha256Hex(pw);
-  await window.storage.set(PASS_KEY, hash, true);
-}
+// ---- password gate for edit mode (requires a valid GitHub token to actually save) ----
 async function checkPassword(pw){
-  const stored = await getStoredHash();
-  if(!stored) return false;
-  const hash = await sha256Hex(pw);
-  return hash === stored;
+  if(!passHash) return false;
+  const h = await sha256Hex(pw);
+  return h === passHash;
 }
 
 async function tryEnableEdit(){
-  const stored = await getStoredHash();
-  if(!stored){
+  let token = await ensureToken();
+  if(!token){
+    alert('편집하려면 먼저 이 저장소에 쓰기 권한이 있는 GitHub 토큰이 필요해요. 다음 창에 입력해주세요.');
+    token = await promptForToken();
+    if(!token) return;
+  }
+  if(!passHash){
     const p1 = prompt('편집 모드에 사용할 교사 비밀번호를 새로 설정해주세요 (4자 이상).');
     if(p1 === null) return;
     if(p1.length < 4){ alert('비밀번호는 4자 이상으로 설정해주세요.'); return; }
     const p2 = prompt('확인을 위해 비밀번호를 한 번 더 입력해주세요.');
     if(p2 !== p1){ alert('비밀번호가 일치하지 않습니다. 다시 시도해주세요.'); return; }
-    await savePassword(p1);
-    editMode = true;
-    updateModeBtn(); renderTabs(); renderPage();
-    alert('편집 비밀번호가 설정되었습니다. 다음부터는 이 비밀번호로 편집 모드를 켤 수 있어요.');
+    passHash = await sha256Hex(p1);
+    document.getElementById('saveNote').textContent = 'GitHub에 저장 중…';
+    try{
+      await commitData();
+      document.getElementById('saveNote').textContent = '저장됨';
+      editMode = true;
+      updateModeBtn(); renderTabs(); renderPage();
+      alert('편집 비밀번호가 설정되고 GitHub 저장소에 저장되었습니다. 다음부터는 이 비밀번호로 편집 모드를 켤 수 있어요.');
+    }catch(e){
+      passHash = null;
+      document.getElementById('saveNote').textContent = '저장 실패 · ' + e.message;
+      alert('비밀번호 저장에 실패했습니다: ' + e.message);
+    }
     return;
   }
   const input = prompt('편집 모드 비밀번호를 입력하세요.');
@@ -1313,8 +1357,17 @@ document.getElementById('changePassBtn').addEventListener('click', async () => {
   if(p1.length < 4){ alert('비밀번호는 4자 이상으로 설정해주세요.'); return; }
   const p2 = prompt('새 비밀번호를 한 번 더 입력해주세요.');
   if(p2 !== p1){ alert('비밀번호가 일치하지 않습니다.'); return; }
-  await savePassword(p1);
-  alert('비밀번호가 변경되었습니다.');
+  const oldHash = passHash;
+  passHash = await sha256Hex(p1);
+  document.getElementById('saveNote').textContent = 'GitHub에 저장 중…';
+  try{
+    await commitData();
+    document.getElementById('saveNote').textContent = '저장됨';
+    alert('비밀번호가 변경되었습니다.');
+  }catch(e){
+    passHash = oldHash;
+    alert('비밀번호 변경에 실패했습니다: ' + e.message);
+  }
 });
 
 function updateModeBtn(){
@@ -1335,7 +1388,6 @@ function updateModeBtn(){
     changeBtn.style.display = 'none';
     fontPanel.style.display = 'none';
     penPanel.style.display = 'none';
-    // leaving edit mode always turns the pen off too
     penMode = false;
     eraserMode = false;
     document.getElementById('penToggleBtn').textContent = '🖊️ 펜 켜기';
@@ -1348,7 +1400,7 @@ function updateModeBtn(){
 }
 
 updateModeBtn();
-loadSettings().then(loadUnits);
+loadAll();
 </script>
 </body>
 </html>
